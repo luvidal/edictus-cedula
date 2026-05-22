@@ -10,7 +10,7 @@ function _interopDefault (e) { return e && e.__esModule ? e : { default: e }; }
 var sharp__default = /*#__PURE__*/_interopDefault(sharp);
 
 // src/config.ts
-var GLOBAL_KEY = "__avd_docprocessor__";
+var GLOBAL_KEY = "__jogi_cedula__";
 function getGlobal() {
   const g = globalThis;
   if (!g[GLOBAL_KEY]) {
@@ -43,7 +43,7 @@ function getRawDoctypes() {
   const raw = getGlobal().rawDoctypes;
   if (!raw) {
     throw new Error(
-      "@jogi/docprocessor: doctypes not configured. Call configure({ doctypes }) before using doctype functions."
+      "@jogi/cedula: doctypes not configured. Call configure({ doctypes }) before using doctype functions."
     );
   }
   return raw;

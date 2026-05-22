@@ -11,9 +11,11 @@ export interface DocProcessorLogger {
  */
 export type GeminiCall = (params: { model: string; contents: any; config?: any }) => Promise<any>
 
-// Use globalThis to share state across multiple entry points (doctypes/, multipart/, index)
-// With splitting: false, tsup gives each entry its own module scope — but globalThis is shared.
-const GLOBAL_KEY = '__avd_docprocessor__' as const
+// Use globalThis to share state across module scopes within this package.
+// MUST be distinct from @jogi/docs's key (`__avd_docprocessor__`) so the two
+// packages keep independent doctypes/geminiCall/logger state — @jogi/cedula is
+// configured separately and must survive @jogi/docs's eventual retirement.
+const GLOBAL_KEY = '__jogi_cedula__' as const
 
 interface DocProcessorGlobal {
   logger: DocProcessorLogger
@@ -61,7 +63,7 @@ export function getRawDoctypes(): Record<string, unknown> {
   const raw = getGlobal().rawDoctypes
   if (!raw) {
     throw new Error(
-      '@jogi/docprocessor: doctypes not configured. Call configure({ doctypes }) before using doctype functions.'
+      '@jogi/cedula: doctypes not configured. Call configure({ doctypes }) before using doctype functions.'
     )
   }
   return raw
