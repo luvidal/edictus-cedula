@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.tgz
+
+# Regression corpus — image bytes + cleartext field store stay maintainer-local.
+# Only the PII-safe baselines (hashed field values) + the runner are committed.
+corpus/images/
+corpus/cleartext/

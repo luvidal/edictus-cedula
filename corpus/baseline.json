@@ -1,0 +1,208 @@
+{
+  "capturedAt": "2026-05-22T13:54:21.873Z",
+  "note": "PII-safe baseline. Field VALUES are salted-hashed (salt is gitignored). Face crops are sha256 of the base64 crop. Bytes + cleartext are maintainer-local.",
+  "fixtures": {
+    "composite-pdf-1": {
+      "id": "composite-pdf-1",
+      "op": "split",
+      "bugClass": "pdf-rasterize + composite split",
+      "composite": true,
+      "partIds": [
+        "front",
+        "back"
+      ],
+      "renderedMimetype": "image/png",
+      "sourceHashPresent": true,
+      "fields": {
+        "front.apellidos": "d9cb28fdc63f3424",
+        "front.fecha_emision": "8c129026b1add092",
+        "front.fecha_nacimiento": "b757648bab0f9858",
+        "front.fecha_vencimiento": "6d8f30dc249e4769",
+        "front.nacionalidad": "d6f8deb3d9abfc69",
+        "front.nombres": "bbad468a28126c38",
+        "front.numero_documento": "60670d6927b7db95",
+        "front.rut": "032c2ed3d28a4407",
+        "front.sexo": "0cd816175f36f18d",
+        "front.docdate": "8c129026b1add092",
+        "back.docdate": "8c129026b1add092"
+      },
+      "hasFace": true,
+      "faceCropSha": "f2b8a2a1d137774b182506ff9abc880ec337e2b46b1d81083cc55102d2ba8212",
+      "bbox": {
+        "x": 13,
+        "y": 31,
+        "width": 15,
+        "height": 27
+      },
+      "faceConfidence": 100
+    },
+    "composite-image-1": {
+      "id": "composite-image-1",
+      "op": "split",
+      "bugClass": "composite split (stacked image)",
+      "composite": true,
+      "partIds": [
+        "front",
+        "back"
+      ],
+      "renderedMimetype": "image/jpeg",
+      "sourceHashPresent": true,
+      "fields": {
+        "front.apellidos": "f75a4e31b7ccb57f",
+        "front.fecha_emision": "9dbf503476657fb1",
+        "front.fecha_nacimiento": "44de1525db10a1d0",
+        "front.fecha_vencimiento": "394527171587fa78",
+        "front.nacionalidad": "d6f8deb3d9abfc69",
+        "front.nombres": "9754bdab705d807e",
+        "front.numero_documento": "75582ded388ae42b",
+        "front.rut": "109bd3dac590e57d",
+        "front.sexo": "15d642954fa71e00",
+        "front.docdate": "9dbf503476657fb1",
+        "back.lugar_nacimiento": "0e949fe2ee317186",
+        "back.profesion": "8bc19a64b80775e5",
+        "back.docdate": "9dbf503476657fb1"
+      },
+      "hasFace": true,
+      "faceCropSha": "b667a8c358a6e87cb62961d65c09b0c21a7a56b833c10c20d22ebec12b3f3bb8",
+      "bbox": {
+        "x": 7,
+        "y": 31,
+        "width": 18,
+        "height": 41
+      },
+      "faceConfidence": 100
+    },
+    "composite-image-2": {
+      "id": "composite-image-2",
+      "op": "split",
+      "bugClass": "composite split (PNG)",
+      "composite": true,
+      "partIds": [
+        "front",
+        "back"
+      ],
+      "renderedMimetype": "image/png",
+      "sourceHashPresent": true,
+      "fields": {
+        "front.apellidos": "20618de295800410",
+        "front.fecha_emision": "a6f3b1c3564eb9ba",
+        "front.fecha_nacimiento": "d84951a19d841b2a",
+        "front.fecha_vencimiento": "35cbe1cef67b4e14",
+        "front.nacionalidad": "d6f8deb3d9abfc69",
+        "front.nombres": "c0f9ff79f7f94ddd",
+        "front.numero_documento": "a696d75f419a2761",
+        "front.rut": "6167db712f4ef521",
+        "front.sexo": "15d642954fa71e00",
+        "front.docdate": "a6f3b1c3564eb9ba",
+        "back.lugar_nacimiento": "0e7765944d79d5cc",
+        "back.docdate": "a6f3b1c3564eb9ba"
+      },
+      "hasFace": true,
+      "faceCropSha": "b7c1b94ab16b8337c64fd864f95605e2f25353bb4f82dc48fee24980006a10d9",
+      "bbox": {
+        "x": 6,
+        "y": 20,
+        "width": 19,
+        "height": 33
+      },
+      "faceConfidence": 100
+    },
+    "composite-image-gap-1": {
+      "id": "composite-image-gap-1",
+      "op": "split",
+      "bugClass": "whitespace-gap composite (sharp.trim border removal)",
+      "composite": true,
+      "partIds": [
+        "front",
+        "back"
+      ],
+      "renderedMimetype": "image/png",
+      "sourceHashPresent": true,
+      "fields": {
+        "front.apellidos": "2ec55020e7112215",
+        "front.fecha_emision": "7952a850692ca351",
+        "front.fecha_nacimiento": "282f8076ed7e637b",
+        "front.fecha_vencimiento": "a3e9d912908d4555",
+        "front.nacionalidad": "d6f8deb3d9abfc69",
+        "front.nombres": "2600b553e0f1a7cd",
+        "front.numero_documento": "fbbbf8a4701bfbe9",
+        "front.sexo": "0cd816175f36f18d",
+        "front.docdate": "7952a850692ca351",
+        "back.docdate": "7952a850692ca351"
+      },
+      "hasFace": true,
+      "faceCropSha": "5c74209e743e563b33e09836cc688097aebb82872bbc5a7042fadb806c00c407",
+      "bbox": {
+        "x": 33,
+        "y": 55,
+        "width": 7,
+        "height": 37
+      },
+      "faceConfidence": 100
+    },
+    "composite-pdf-multidoc-1": {
+      "id": "composite-pdf-multidoc-1",
+      "op": "split",
+      "bugClass": "multi-doc PDF — page-1 composite cédula only",
+      "composite": true,
+      "partIds": [
+        "front",
+        "back"
+      ],
+      "renderedMimetype": "image/png",
+      "sourceHashPresent": true,
+      "fields": {
+        "front.apellidos": "20618de295800410",
+        "front.fecha_emision": "a6f3b1c3564eb9ba",
+        "front.fecha_nacimiento": "d84951a19d841b2a",
+        "front.fecha_vencimiento": "35cbe1cef67b4e14",
+        "front.nacionalidad": "d6f8deb3d9abfc69",
+        "front.nombres": "c0f9ff79f7f94ddd",
+        "front.numero_documento": "a696d75f419a2761",
+        "front.sexo": "15d642954fa71e00",
+        "front.docdate": "a6f3b1c3564eb9ba",
+        "back.docdate": "a6f3b1c3564eb9ba"
+      },
+      "hasFace": true,
+      "faceCropSha": "cbc9511a06d29feb8991d3b39652a8db7611448c74a88fddce1a59c7ccbea9ec",
+      "bbox": {
+        "x": 4,
+        "y": 34,
+        "width": 19,
+        "height": 57
+      },
+      "faceConfidence": 100
+    },
+    "front-image-1": {
+      "id": "front-image-1",
+      "op": "face",
+      "bugClass": "face extraction (EXIF rotation, largest-face, square crop)",
+      "hasFace": true,
+      "faceCropSha": "205f4e21a5d22f90994feb205309dec9db29fb213a39bc965f744795ef3e10b1",
+      "faceConfidence": 100,
+      "bbox": {
+        "x": 9,
+        "y": 38,
+        "width": 18,
+        "height": 34
+      }
+    },
+    "back-image-1": {
+      "id": "back-image-1",
+      "op": "side",
+      "bugClass": "side detection (back — MRZ/QR/fingerprint, no face)",
+      "side": "back",
+      "sideConfidence": 0.9,
+      "fields": {
+        "profesion": "57fa643911d667d0",
+        "lugar_nacimiento": "c8d4a54cbcb5245b"
+      }
+    },
+    "unreadable-pdf-synthetic": {
+      "id": "unreadable-pdf-synthetic",
+      "op": "split",
+      "bugClass": "unreadable/encrypted PDF → {unreadable} marker",
+      "unreadable": true
+    }
+  }
+}

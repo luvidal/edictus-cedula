@@ -1,0 +1,1483 @@
+/**
+ * OCR and Document Field Extraction
+ *
+ * Extracts structured data from uploaded Chilean documents using AI vision
+ * models (Gemini Flash primary, Claude Haiku fallback).
+ *
+ * ## Extraction Strategy
+ *
+ * ### Images → Split-pass (classifyDocument → extractFields)
+ * Same schema contract as PDFs; images just omit page ranges.
+ *
+ * ### PDFs → Multi-pass (detectDocumentBoundaries → classifyDocument → extractFields)
+ * Pass 0 — Split: detect document boundaries in multi-doc PDFs (no doctype knowledge)
+ * Pass 1 — Classify: each document individually with doctype definitions + field schemas
+ * Pass 2 — Extract: per-type field schemas, parallel across types
+ *
+ * ## Face Photo Extraction (Cédula)
+ * AWS Rekognition via extractFace() — single call, picks largest face.
+ */
+
+import { model2vision, toAiModel, stripFences } from './ai'
+import type { VisionResult, AiModel, ResponseSchema } from './ai'
+import { getDoctypes, getDoctypesMap } from './doctypes'
+import { getLogger } from './config'
+import { PDFDocument } from 'pdf-lib'
+import { extractFace } from './faceextract'
+import sharp from 'sharp'
+import { createHash } from 'crypto'
+import type { ModelArg, ExtractionResult, AIUsage, GeminiModels, AllowedDoctypeIds } from './types'
+
+/** Accumulate token usage across multiple AI calls */
+function addUsage(total: AIUsage, add?: AIUsage): AIUsage {
+    if (!add) return total
+    return {
+        promptTokenCount: (total.promptTokenCount ?? 0) + (add.promptTokenCount ?? 0),
+        candidatesTokenCount: (total.candidatesTokenCount ?? 0) + (add.candidatesTokenCount ?? 0),
+    }
+}
+
+// ─── Cache Helpers ───────────────────────────────────────────────────────────
+
+// Bump this string whenever prompt templates or schema builders change
+// (classifyDocument, extractFields).
+// v7: classifier multi-page branch is now schema-enforced via Gemini `responseSchema`
+// (Phase 1, shape only — `id` enum over known doctypes, `start`/`end` integers,
+// required `confidence` 0–1, `partId` enum on multipart entries). Containers still
+// return parent + children as flat entries. Per-doctype `data` schemas come in Phase 2.
+// The bump invalidates v6 cache entries whose payload may carry off-shape ids or
+// missing confidence values.
+// v8: classifier accepts an optional `allowedDoctypeIds` candidate-doctype enum
+// override (Phase 7a — request-context narrowing). When set, the schema enum
+// and prompt type-list are restricted to that subset, so the model can't return
+// off-list doctypes for the upload's request scope. Container fallback (Phase
+// 7b) reuses the same mechanism with `parent.contains` as the candidate set.
+// Cache entries are not affected by the option itself; the Jogi-side cache key
+// folds the candidate set so narrowed and full-catalog calls don't collide.
+// v9: container second-pass classification preserves the classifier's detected
+// container range instead of rewriting each container to the full PDF. Mixed PDFs
+// can now keep a carpeta-tributaria slice on only its detected pages.
+// v10: Phase 2 — multi-page classifier `responseSchema` carries per-doctype
+// `data` object schemas as discriminated `anyOf` branches keyed on `id`. The
+// six covered doctypes (`cedula-identidad`, `liquidaciones-sueldo`,
+// `informe-deuda`, `padron`, `declaracion-anual-impuestos`,
+// `resumen-boletas-sii`) get explicit data shapes; remaining doctypes share a
+// fallback branch with no `data` constraint. The classify prompt now also
+// instructs the model to populate `data` + `docdate` inline. The merge step
+// falls back to classify-inline data when extractFields returns empty so the
+// inline payload isn't silently dropped on extract failures. v9 cache entries
+// are invalidated by the bump (new payload shape, new prompt).
+// v11: Pass 2 `extractFields` is schema-enforced for the same six covered
+// doctypes through `buildExtractResponseSchema`. Forced/rangeless extraction
+// keeps PDF start/end optional. Images now use the split classify/extract path,
+// and the Pass 1/Pass 2 merge is field-level: Pass 2 wins for present values,
+// Pass 1 fills missing/null/empty gaps. The cache key also hashes classifier
+// and extractor schema output so schema-only edits invalidate stale AI caches.
+// v12: schema-enforced classify retries Vertex 400 INVALID_ARGUMENT once with
+// a shape-only schema that preserves id/confidence/part/page invariants but
+// removes Phase 2 per-doctype data branches.
+const PROMPT_TEMPLATE_VERSION = 'v12'
+
+/**
+ * Returns a short hash that changes when doctypes schema or prompt templates change.
+ * Used as part of the AI cache key.
+ */
+export function getPromptVersion(): string {
+    return createHash('sha256')
+        .update(JSON.stringify(getDoctypes()))
+        .update(PROMPT_TEMPLATE_VERSION)
+        .update(JSON.stringify(getSchemaVersionPayload()))
+        .digest('hex')
+        .slice(0, 12)
+}
+
+/**
+ * Build a cache key from the three inputs that determine AI output:
+ * file content (hash), model, and prompt version.
+ */
+export function buildCacheKey(fileHash: string, model: string, promptVersion: string): string {
+    return createHash('sha256')
+        .update(fileHash + model + promptVersion)
+        .digest('hex')
+        .slice(0, 32)
+}
+
+// Lazy-load pdf-to-png-converter to avoid loading native canvas at startup
+let pdfToPngModule: typeof import('pdf-to-png-converter') | null = null
+const getPdfToPng = async () => {
+    if (!pdfToPngModule) {
+        pdfToPngModule = await import('pdf-to-png-converter')
+    }
+    return pdfToPngModule.pdfToPng
+}
+
+/**
+ * Extract a specific page from a PDF as a PNG image buffer
+ */
+export async function extractPdfPageAsImage(pdfBuffer: Buffer, pageNumber: number): Promise<Buffer | null> {
+    try {
+        const arrayBuffer = pdfBuffer.buffer.slice(
+            pdfBuffer.byteOffset,
+            pdfBuffer.byteOffset + pdfBuffer.byteLength
+        )
+
+        const pdfToPng = await getPdfToPng()
+        const pages = await pdfToPng(arrayBuffer, {
+            pagesToProcess: [pageNumber],
+            viewportScale: 2.0,
+            returnPageContent: true,
+        })
+
+        if (pages.length > 0 && pages[0].content) {
+            return Buffer.from(pages[0].content)
+        }
+        return null
+    } catch {
+        return null
+    }
+}
+
+/**
+ * Detect which side of a cedula is shown in an image
+ */
+export async function detectCedulaSide(
+    buffer: Buffer,
+    mimetype: string,
+    model: ModelArg = 'gemini'
+): Promise<{ side: 'front' | 'back' | null; confidence: number; data?: object }> {
+    const isImage = mimetype.startsWith('image/')
+    const isPDF = mimetype === 'application/pdf'
+    if (!isImage && !isPDF) throw new Error('Images and PDFs only')
+
+    const base64 = buffer.toString('base64')
+
+    const prompt = `
+    Analiza esta imagen de una Cédula de Identidad chilena y determina si es el FRENTE o el REVÉS.
+
+    **FRENTE (front)** - Características:
+    - Foto del titular
+    - Nombre completo
+    - RUT
+    - Nacionalidad
+    - Fecha de nacimiento
+    - Sexo
+    - Número de documento
+    - Fecha de emisión/vencimiento
+
+    **REVÉS (back)** - Características:
+    - Huella dactilar
+    - Firma del titular
+    - Código de barras o QR
+    - Dirección (en cédulas antiguas)
+    - Profesión u oficio
+    - Texto institucional del Registro Civil
+
+    Devuelve SOLO este JSON:
+    {
+      "side": "front" | "back" | null,
+      "confidence": 0.0-1.0,
+      "reason": "breve explicación",
+      "data": {
+        // Si es front: rut, nombres, apellidos, fecha_nacimiento, foto_bbox, etc.
+        // Si es back: profesion, lugar_nacimiento ("Nació en"), direccion (si visible)
+      }
+    }
+
+    **UBICACIÓN DE LA FOTO (solo si es FRENTE)**:
+    Si detectas que es el FRENTE de la cédula, incluye el campo "foto_bbox" con las coordenadas del recuadro de la foto del titular.
+    Las coordenadas deben ser porcentajes (0-100) relativos al tamaño de la imagen.
+    IMPORTANTE: La foto incluye cabeza completa, cuello y parte de los hombros. Incluye TODO el rostro desde la parte superior de la cabeza.
+    - x: posición horizontal del borde izquierdo de la foto
+    - y: posición vertical del borde superior de la foto (empieza ARRIBA de la cabeza)
+    - width: ancho de la foto
+    - height: alto de la foto (debe cubrir desde arriba de la cabeza hasta los hombros)
+    En cédulas chilenas, la foto típicamente está en la esquina superior izquierda.
+    Ejemplo: "foto_bbox": { "x": 3, "y": 12, "width": 28, "height": 45 }
+
+    Si la imagen NO es una cédula chilena, devuelve side: null.
+    `
+
+    const aiModel = toAiModel(model)
+    const vr = await model2vision(aiModel, mimetype, base64, prompt)
+    let text = stripFences(vr.text)
+
+    try {
+        const parsed = JSON.parse(text)
+        const data = parsed.data || {}
+
+        if (parsed.side === 'front') {
+            let imageBuffer: Buffer | null = null
+
+            if (isImage) {
+                imageBuffer = buffer
+            } else if (isPDF) {
+                imageBuffer = await extractPdfPageAsImage(buffer, 1)
+            }
+
+            if (imageBuffer) {
+                const result = await extractFace(imageBuffer)
+                if (result) {
+                    data.foto_base64 = result.face
+                }
+            }
+            delete data.foto_bbox
+        }
+
+        return {
+            side: parsed.side === 'front' || parsed.side === 'back' ? parsed.side : null,
+            confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0,
+            data
+        }
+    } catch {
+        return { side: null, confidence: 0 }
+    }
+}
+
+// ─── Two-Pass Extraction ─────────────────────────────────────────────────────
+
+function loadSchemas() {
+    const doctypes = getDoctypes()
+    const mapById = getDoctypesMap()
+    return { doctypes, mapById }
+}
+
+/** Parse raw AI response into normalized document array */
+export function parseRawDocs(text: string): any[] {
+    const cleaned = stripFences(text)
+    if (!cleaned) return []
+    try {
+        const parsed = JSON.parse(cleaned)
+        if (Array.isArray(parsed)) {
+            if (parsed.length > 0 && Array.isArray(parsed[0]?.documents)) {
+                return parsed.flatMap((p: any) => p.documents || [])
+            }
+            return parsed
+        }
+        if (Array.isArray(parsed?.documents)) return parsed.documents
+        if (parsed?.id || parsed?.doctypeid) return [parsed]
+        return []
+    } catch {
+        // Truncated JSON — extract complete top-level objects by brace-matching
+        const recovered: any[] = []
+        let i = 0
+        while (i < cleaned.length) {
+            if (cleaned[i] === '{') {
+                let depth = 0, inStr = false, escape = false
+                const start = i
+                for (; i < cleaned.length; i++) {
+                    const ch = cleaned[i]
+                    if (escape) { escape = false; continue }
+                    if (ch === '\\' && inStr) { escape = true; continue }
+                    if (ch === '"' && !escape) { inStr = !inStr; continue }
+                    if (inStr) continue
+                    if (ch === '{') depth++
+                    else if (ch === '}') { depth--; if (depth === 0) { i++; break } }
+                }
+                if (depth === 0) {
+                    try {
+                        const obj = JSON.parse(cleaned.slice(start, i))
+                        if (obj.id || obj.doctypeid || obj.doc_type_id) recovered.push(obj)
+                    } catch { /* skip malformed */ }
+                }
+            } else {
+                i++
+            }
+        }
+        return recovered
+    }
+}
+
+/** Normalize a single raw doc entry from AI response */
+export function normalizeDoc(d: any) {
+    const id = d?.id || d?.doctypeid || null
+    const META_KEYS = new Set(['id', 'doctypeid', 'doc_type_id', 'data', 'docdate', 'document_date', 'documentDate', 'confidence', 'start', 'end', 'partId', 'part_id', 'partid', 'label'])
+    const flatData = Object.fromEntries(Object.entries(d || {}).filter(([k]) => !META_KEYS.has(k)))
+    const data = d?.data && typeof d.data === 'object' ? d.data : Object.keys(flatData).length > 0 ? flatData : {}
+    const rawDate = d?.docdate || d?.document_date || d?.documentDate || null
+    // Validate YYYY-MM-DD format — AI sometimes returns DD/MM/YYYY or free text
+    const docdate = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) && !isNaN(new Date(`${rawDate}T12:00:00`).getTime()) ? rawDate : null
+    const start = Number.isFinite(d?.start) ? Number(d.start) : (d?.start ? parseInt(d.start, 10) : undefined)
+    const end = Number.isFinite(d?.end) ? Number(d.end) : (d?.end ? parseInt(d.end, 10) : undefined)
+    const partId = d?.partId || d?.part_id || d?.partid || undefined
+    const confidence = typeof d?.confidence === 'number' && d.confidence >= 0 && d.confidence <= 1 ? d.confidence : undefined
+    return { id, data, docdate, start, end, partId, confidence }
+}
+
+// ─── Pass 0: Detect document boundaries in multi-doc PDFs ───────────────────
+
+async function detectDocumentBoundaries(
+    base64: string, model: AiModel, totalPages: number,
+    usageAccum?: AIUsage,
+    geminiModel?: string,
+): Promise<Array<{ start: number; end: number }>> {
+    const prompt = `Este PDF tiene ${totalPages} páginas y puede contener múltiples documentos combinados.
+Identifica los límites de cada documento separado dentro del PDF.
+Devuelve JSON: {"documents":[{"start":1,"end":3},{"start":4,"end":4},{"start":5,"end":8}]}
+- "start"/"end": páginas 1-indexed
+- Cada documento es un bloque continuo de páginas que pertenecen al mismo documento original
+- Busca cambios de formato, encabezados, logos, o estilos que indiquen un documento diferente
+- Si todo el PDF es un solo documento, devuelve [{"start":1,"end":${totalPages}}]
+- Solo JSON, sin markdown`
+
+    const vr = await model2vision(model, 'application/pdf', base64, prompt, geminiModel)
+    if (usageAccum) Object.assign(usageAccum, addUsage(usageAccum, vr.usage))
+    const parsed = parseRawDocs(vr.text)
+
+    if (!parsed.length) return [{ start: 1, end: totalPages }]
+
+    return parsed
+        .map((d: any) => ({
+            start: Number.isFinite(d?.start) ? Number(d.start) : parseInt(d?.start, 10),
+            end: Number.isFinite(d?.end) ? Number(d.end) : parseInt(d?.end, 10),
+        }))
+        .filter((d: { start: number; end: number }) => Number.isFinite(d.start) && Number.isFinite(d.end))
+}
+
+// ─── Pass 1: Classify ────────────────────────────────────────────────────────
+
+/**
+ * Doctypes covered by Phase 2 per-doctype `data` object schemas. Anything
+ * outside this set falls into the schema's fallback branch (no `data`
+ * constraint). Restricted to doctypes whose extracted-field shape is stable —
+ * additions go through review.
+ */
+const DATA_SCHEMA_DOCTYPES = new Set<string>([
+    'cedula-identidad',
+    'liquidaciones-sueldo',
+    'informe-deuda',
+    'padron',
+    'declaracion-anual-impuestos',
+    'resumen-boletas-sii',
+])
+
+/** Convenience builders to keep per-doctype schemas readable. */
+const STR = { type: 'STRING', nullable: true } as ResponseSchema
+const NUM = { type: 'NUMBER', nullable: true } as ResponseSchema
+
+/**
+ * Hand-written `data` object schema per doctype. Returns `null` for doctypes
+ * whose data shape is still in flux — the responseSchema then falls them into
+ * the no-data fallback branch.
+ *
+ * Properties are nullable rather than required: a single missing field on a
+ * scanned document shouldn't make Gemini reject the entire response. Page
+ * coverage, overlap, and per-doctype sanity stay enforced app-side.
+ */
+export function buildDataSchemaForDoctype(docTypeId: string): ResponseSchema | null {
+    switch (docTypeId) {
+        case 'cedula-identidad':
+            return {
+                type: 'OBJECT',
+                nullable: true,
+                properties: {
+                    rut: STR,
+                    nombres: STR,
+                    apellidos: STR,
+                    nacionalidad: STR,
+                    sexo: STR,
+                    fecha_nacimiento: STR,
+                    numero_documento: STR,
+                    fecha_emision: STR,
+                    fecha_vencimiento: STR,
+                    lugar_nacimiento: STR,
+                    profesion: STR,
+                },
+            }
+        case 'liquidaciones-sueldo': {
+            const lineItem: ResponseSchema = {
+                type: 'OBJECT',
+                properties: {
+                    label: STR,
+                    value: NUM,
+                },
+            }
+            return {
+                type: 'OBJECT',
+                nullable: true,
+                properties: {
+                    empleador: STR,
+                    nombre: STR,
+                    rut: STR,
+                    periodo: STR,
+                    dias_trabajados: NUM,
+                    fecha_ingreso: STR,
+                    cargo: STR,
+                    institucion_previsional: STR,
+                    institucion_salud: STR,
+                    base_imponible: NUM,
+                    base_tributable: NUM,
+                    haberes: { type: 'ARRAY', nullable: true, items: lineItem },
+                    descuentos: { type: 'ARRAY', nullable: true, items: lineItem },
+                },
+            }
+        }
+        case 'informe-deuda': {
+            const deudaItem: ResponseSchema = {
+                type: 'OBJECT',
+                properties: {
+                    entidad: STR,
+                    tipo: STR,
+                    total_credito: NUM,
+                    vigente: NUM,
+                    atraso_30_59: NUM,
+                    atraso_60_89: NUM,
+                    atraso_90_mas: NUM,
+                },
+            }
+            const creditoItem: ResponseSchema = {
+                type: 'OBJECT',
+                properties: {
+                    entidad: STR,
+                    directos: NUM,
+                    indirectos: NUM,
+                },
+            }
+            return {
+                type: 'OBJECT',
+                nullable: true,
+                properties: {
+                    rut: STR,
+                    nombre: STR,
+                    deuda_total: NUM,
+                    fecha_informe: STR,
+                    deudas: { type: 'ARRAY', nullable: true, items: deudaItem },
+                    deudas_indirectas: { type: 'ARRAY', nullable: true, items: deudaItem },
+                    lineas_credito: { type: 'ARRAY', nullable: true, items: creditoItem },
+                    otros_creditos: { type: 'ARRAY', nullable: true, items: creditoItem },
+                },
+            }
+        }
+        case 'padron':
+            return {
+                type: 'OBJECT',
+                nullable: true,
+                properties: {
+                    inscripcion: STR,
+                    rut_propietario: STR,
+                    propietario: STR,
+                    domicilio: STR,
+                    comuna: STR,
+                    fecha_adquisicion: STR,
+                    fecha_inscripcion: STR,
+                    fecha_emision: STR,
+                    marca: STR,
+                    modelo: STR,
+                    motor: STR,
+                    chasis: STR,
+                    color: STR,
+                    tasacion_fiscal: NUM,
+                    'año': NUM,
+                },
+            }
+        case 'declaracion-anual-impuestos': {
+            // F22 codes the planner consumes for derived fields. Listing the
+            // known codes (rather than leaving `codes` open) lets the schema
+            // anchor each value as a nullable NUMBER without forcing the model
+            // to invent unseen codes.
+            const codeKeys = ['547', '110', '104', '105', '155', '161', '170', '305']
+            const codes: Record<string, ResponseSchema> = {}
+            for (const k of codeKeys) codes[k] = NUM
+            return {
+                type: 'OBJECT',
+                nullable: true,
+                properties: {
+                    rut: STR,
+                    nombre: STR,
+                    'año_tributario': NUM,
+                    codes: {
+                        type: 'OBJECT',
+                        nullable: true,
+                        properties: codes,
+                    },
+                },
+            }
+        }
+        case 'resumen-boletas-sii': {
+            const monthRow: ResponseSchema = {
+                type: 'OBJECT',
+                nullable: true,
+                properties: {
+                    boletas_vigentes: NUM,
+                    honorario_bruto: NUM,
+                    retencion: NUM,
+                    liquido: NUM,
+                },
+            }
+            const months: Record<string, ResponseSchema> = {}
+            const monthKeys = [
+                'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+                'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre',
+            ]
+            for (const m of monthKeys) months[m] = monthRow
+            return {
+                type: 'OBJECT',
+                nullable: true,
+                properties: {
+                    rut: STR,
+                    contribuyente: STR,
+                    'año': NUM,
+                    totales: {
+                        type: 'OBJECT',
+                        nullable: true,
+                        properties: {
+                            boletas_vigentes: NUM,
+                            boletas_anuladas: NUM,
+                            honorario_bruto: NUM,
+                            retencion_terceros: NUM,
+                            retencion_contribuyente: NUM,
+                            total_liquido: NUM,
+                        },
+                    },
+                    meses: {
+                        type: 'OBJECT',
+                        nullable: true,
+                        properties: months,
+                    },
+                },
+            }
+        }
+        default:
+            return null
+    }
+}
+
+/**
+ * Build the Gemini `responseSchema` for the multi-page classifier.
+ *
+ * Phase 1 (shape) and Phase 2 (per-doctype `data`) are folded into one
+ * builder. Each branch in `documents.items.anyOf` is keyed on `id` (a
+ * single-value enum acts as the discriminator):
+ *
+ * - Doctypes in {@link DATA_SCHEMA_DOCTYPES} get a dedicated branch with
+ *   `data` (per-doctype object schema) and `docdate` (string, nullable).
+ * - Every other candidate doctype shares one fallback branch with no `data`
+ *   constraint — keeps the schema small and tolerant for unaudited shapes.
+ *
+ * Shape-level invariants (still enforced):
+ * - `id` is enum-restricted to the candidate doctype list.
+ * - `start`/`end` are integers (PDF only).
+ * - `confidence` is required and bounded `[0,1]`.
+ * - `partId` is the `front | back` enum, nullable.
+ *
+ * The app still independently validates page coverage, overlaps, request
+ * authorization, and per-doctype sanity.
+ */
+export function buildClassifyResponseSchema(
+    doctypeIds: string[],
+    isPDF: boolean,
+): ResponseSchema {
+    const buildBaseProps = (idEnum: string[]): Record<string, ResponseSchema> => {
+        const props: Record<string, ResponseSchema> = {
+            id: { type: 'STRING', enum: idEnum },
+            confidence: { type: 'NUMBER', minimum: 0, maximum: 1 },
+            partId: { type: 'STRING', enum: ['front', 'back'], nullable: true },
+        }
+        if (isPDF) {
+            props.start = { type: 'INTEGER', minimum: 1 }
+            props.end = { type: 'INTEGER', minimum: 1 }
+        }
+        return props
+    }
+    const baseRequired = isPDF ? ['id', 'confidence', 'start', 'end'] : ['id', 'confidence']
+
+    const branches: ResponseSchema[] = []
+    const fallbackIds: string[] = []
+
+    for (const id of doctypeIds) {
+        const dataSchema = DATA_SCHEMA_DOCTYPES.has(id) ? buildDataSchemaForDoctype(id) : null
+        if (!dataSchema) {
+            fallbackIds.push(id)
+            continue
+        }
+        branches.push({
+            type: 'OBJECT',
+            properties: {
+                ...buildBaseProps([id]),
+                data: dataSchema,
+                docdate: { type: 'STRING', nullable: true },
+            },
+            required: baseRequired,
+        })
+    }
+    if (fallbackIds.length > 0 || branches.length === 0) {
+        // Fallback: the existing Phase 1 shape (no `data`/`docdate` constraint).
+        // Always include it when at least one candidate is uncovered, and as the
+        // sole branch when the caller passed an empty doctype list (defensive
+        // for the empty-narrowed-pass edge case).
+        branches.push({
+            type: 'OBJECT',
+            properties: buildBaseProps(fallbackIds.length > 0 ? fallbackIds : doctypeIds),
+            required: baseRequired,
+        })
+    }
+
+    const items: ResponseSchema = branches.length === 1
+        ? branches[0]
+        : { anyOf: branches } as ResponseSchema
+
+    return {
+        type: 'OBJECT',
+        properties: {
+            documents: {
+                type: 'ARRAY',
+                items,
+            },
+        },
+        required: ['documents'],
+    }
+}
+
+export function buildShapeOnlyClassifyResponseSchema(
+    doctypeIds: string[],
+    isPDF: boolean,
+): ResponseSchema {
+    const itemProps: Record<string, ResponseSchema> = {
+        id: { type: 'STRING', enum: doctypeIds },
+        confidence: { type: 'NUMBER', minimum: 0, maximum: 1 },
+        partId: { type: 'STRING', enum: ['front', 'back'], nullable: true },
+    }
+    const required = isPDF ? ['id', 'confidence', 'start', 'end'] : ['id', 'confidence']
+    if (isPDF) {
+        itemProps.start = { type: 'INTEGER', minimum: 1 }
+        itemProps.end = { type: 'INTEGER', minimum: 1 }
+    }
+
+    return {
+        type: 'OBJECT',
+        properties: {
+            documents: {
+                type: 'ARRAY',
+                items: {
+                    type: 'OBJECT',
+                    properties: itemProps,
+                    required,
+                },
+            },
+        },
+        required: ['documents'],
+    }
+}
+
+function isGeminiInvalidArgumentError(err: unknown): boolean {
+    const e = err as any
+    const status = e?.status ?? e?.statusCode ?? e?.code
+    const nestedStatus = e?.error?.status ?? e?.error?.code
+    const statusLooks400 = status === 400 || status === '400' || nestedStatus === 400 || nestedStatus === '400'
+    const invalidStatus = status === 'INVALID_ARGUMENT' || nestedStatus === 'INVALID_ARGUMENT'
+    const message = [
+        e?.message,
+        e?.status,
+        e?.statusCode,
+        e?.code,
+        e?.error?.message,
+        e?.error?.status,
+        e?.error?.code,
+    ].filter(Boolean).join(' ').toLowerCase()
+    const messageLooksInvalid = message.includes('invalid_argument') || message.includes('invalid argument')
+    // @google/genai ClientError exposes nothing on the err object — status/code
+    // live only inside err.message ("got status: 400 Bad Request. {...}"), so
+    // the structured checks above all return false. Recognize the same signal
+    // from the message itself so the shape-only retry path actually fires.
+    const messageLooks400 = /\b400\b/.test(message) || message.includes('bad request')
+    return invalidStatus || (statusLooks400 && messageLooksInvalid) || (messageLooks400 && messageLooksInvalid)
+}
+
+type ClassifiedDoc = {
+    id: string
+    start?: number
+    end?: number
+    partId?: string
+    confidence?: number
+    data?: Record<string, unknown>
+    docdate?: string | null
+}
+
+function normalizeClassifyDocs(rawDocs: any[], options: { requireConfidence?: boolean; allowedIds?: string[] } = {}): ClassifiedDoc[] {
+    const allowed = options.allowedIds ? new Set(options.allowedIds) : null
+    return rawDocs.map((d: any) => {
+        const id = d?.id || d?.doctypeid || d?.doc_type_id || null
+        const start = Number.isFinite(d?.start) ? Number(d.start) : (d?.start ? parseInt(d.start, 10) : undefined)
+        const end = Number.isFinite(d?.end) ? Number(d.end) : (d?.end ? parseInt(d.end, 10) : undefined)
+        const partId = d?.partId || d?.part_id || d?.partid || undefined
+        const confidence = typeof d?.confidence === 'number' && d.confidence >= 0 && d.confidence <= 1 ? d.confidence : undefined
+        const data = d?.data && typeof d.data === 'object' && !Array.isArray(d.data) ? d.data as Record<string, unknown> : undefined
+        const rawDate = d?.docdate || d?.document_date || d?.documentDate || null
+        const docdate = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) && !isNaN(new Date(`${rawDate}T12:00:00`).getTime()) ? rawDate : null
+        return {
+            id,
+            ...(Number.isFinite(start) ? { start } : {}),
+            ...(Number.isFinite(end) ? { end } : {}),
+            ...(partId ? { partId } : {}),
+            ...(confidence !== undefined ? { confidence } : {}),
+            ...(data ? { data } : {}),
+            ...(docdate ? { docdate } : {}),
+        }
+    }).filter((d: any): d is ClassifiedDoc =>
+        !!d.id &&
+        (!allowed || allowed.has(d.id)) &&
+        (!options.requireConfidence || typeof d.confidence === 'number')
+    )
+}
+
+export function buildExtractResponseSchema(
+    docTypeId: string,
+    isPDF: boolean,
+    entries: Array<{ start?: number; end?: number; partId?: string }>,
+): ResponseSchema | null {
+    if (!DATA_SCHEMA_DOCTYPES.has(docTypeId)) return null
+    const dataSchema = buildDataSchemaForDoctype(docTypeId)
+    if (!dataSchema) return null
+
+    const hasConcreteRanges = entriesHaveConcreteRanges(isPDF, entries)
+
+    const properties: Record<string, ResponseSchema> = {
+        id: { type: 'STRING', enum: [docTypeId] },
+        data: dataSchema,
+        docdate: { type: 'STRING', nullable: true },
+        partId: { type: 'STRING', enum: ['front', 'back'], nullable: true },
+    }
+    const required = ['id', 'data']
+
+    if (isPDF) {
+        properties.start = { type: 'INTEGER', minimum: 1 }
+        properties.end = { type: 'INTEGER', minimum: 1 }
+        if (hasConcreteRanges) required.push('start', 'end')
+    }
+
+    return {
+        type: 'OBJECT',
+        properties: {
+            documents: {
+                type: 'ARRAY',
+                items: {
+                    type: 'OBJECT',
+                    properties,
+                    required,
+                },
+            },
+        },
+        required: ['documents'],
+    }
+}
+
+function entriesHaveConcreteRanges(
+    isPDF: boolean,
+    entries: Array<{ start?: number; end?: number; partId?: string }>,
+): boolean {
+    return isPDF && entries.length > 0 && entries.every(e =>
+        Number.isInteger(e.start) &&
+        Number.isInteger(e.end) &&
+        (e.start as number) >= 1 &&
+        (e.end as number) >= (e.start as number)
+    )
+}
+
+function getSchemaVersionPayload(): unknown {
+    const doctypeIds = getDoctypes().map(dt => dt.id)
+    const extractSchemas = [...DATA_SCHEMA_DOCTYPES].sort().map(id => ({
+        id,
+        image: buildExtractResponseSchema(id, false, [{}]),
+        pdfRanged: buildExtractResponseSchema(id, true, [{ start: 1, end: 1 }]),
+        pdfRangeless: buildExtractResponseSchema(id, true, [{}]),
+    }))
+    return {
+        classifyImage: buildClassifyResponseSchema(doctypeIds, false),
+        classifyPdf: buildClassifyResponseSchema(doctypeIds, true),
+        classifyImageShapeOnly: buildShapeOnlyClassifyResponseSchema(doctypeIds, false),
+        classifyPdfShapeOnly: buildShapeOnlyClassifyResponseSchema(doctypeIds, true),
+        extractSchemas,
+    }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isMergeGap(value: unknown): boolean {
+    if (value === undefined || value === null) return true
+    if (typeof value === 'string') return value.trim() === ''
+    if (Array.isArray(value)) return value.length === 0
+    if (isPlainRecord(value)) return Object.keys(value).length === 0
+    return false
+}
+
+function mergeFieldValue(pass1: unknown, pass2: unknown): unknown {
+    if (isPlainRecord(pass1) && isPlainRecord(pass2)) {
+        return mergePassData(pass1, pass2)
+    }
+    return isMergeGap(pass2) ? pass1 : pass2
+}
+
+function mergePassData(
+    pass1: Record<string, unknown> | null | undefined,
+    pass2: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+    const first = isPlainRecord(pass1) ? pass1 : {}
+    const second = isPlainRecord(pass2) ? pass2 : {}
+    const merged: Record<string, unknown> = { ...first }
+
+    for (const key of Object.keys(second)) {
+        merged[key] = mergeFieldValue(first[key], second[key])
+    }
+
+    return merged
+}
+
+async function classifyDocument(
+    base64: string, mimetype: string, model: AiModel, isPDF: boolean,
+    doctypes: Array<{ id: string; label: string; definition: string; fieldDefs?: any[] }>,
+    usageAccum?: AIUsage,
+    geminiModel?: string,
+): Promise<ClassifiedDoc[]> {
+    const typeList = doctypes.map(dt => {
+        const base = `• ${dt.id}: ${dt.definition || dt.label}`
+        if (!dt.fieldDefs?.length) return base
+        const fields = JSON.stringify(dt.fieldDefs.map((f: any) => {
+            const entry: any = { key: f.key, type: f.type }
+            if (f.ai) entry.ai = f.ai
+            return entry
+        }))
+        return `${base}\n  fields: ${fields}`
+    }).join('\n')
+
+    // Phase 2 — listing the doctypes whose `data` is enforced by the
+    // responseSchema's discriminated branches. The model is asked to populate
+    // those inline; everything else may omit `data`/`docdate` and falls into
+    // the schema's no-data fallback branch.
+    const inlineDataIds = doctypes.map(d => d.id).filter(id => DATA_SCHEMA_DOCTYPES.has(id))
+    const inlineDataLine = inlineDataIds.length > 0
+        ? `Para los tipos { ${inlineDataIds.join(', ')} }, además del id/confidence/rango incluye "data" (objeto con los campos del esquema correspondiente — usa el "key" exacto de "fields" arriba) y "docdate" (formato YYYY-MM-DD; la fecha a la que CORRESPONDE la información, NO la fecha de descarga). Para otros tipos, "data" y "docdate" son opcionales.`
+        : ''
+
+    const prompt = `Identifica los tipos de documento en este archivo chileno.
+Si el archivo NO corresponde a ninguno de los tipos listados abajo, devuelve {"documents":[]}.
+Devuelve JSON: {"documents":[{"id":"tipo-id","confidence":0.0-1.0${isPDF ? ',"start":1,"end":1' : ''},"partId":"front|back","data":{...},"docdate":"YYYY-MM-DD"}]}
+${isPDF
+    ? `"start"/"end": páginas 1-indexed. Si un tipo aparece múltiples veces (ej: varias liquidaciones), devuelve uno por instancia con su rango de páginas. Páginas que no correspondan a ningún tipo listado deben ignorarse.
+Si una página contiene AMBAS caras de una cédula (frente y reverso), devuelve DOS elementos con la misma página y diferente partId.`
+    : `Si la imagen contiene AMBAS caras de una cédula (frente y reverso apilados), devuelve DOS elementos. Para otro documento, devuelve uno solo.`
+}
+"partId": solo para cédula-identidad. Frente tiene foto/RUT/nombre. Reverso tiene firma/huella/profesión.
+"confidence": 0.0-1.0, qué tan seguro estás del tipo. 1.0 = totalmente seguro; 0.7 = duda menor; <0.5 = devuelve {"documents":[]}.
+- Si no estás seguro del tipo, devuelve {"documents":[]}. Es mejor no clasificar que clasificar mal.
+- Campos type:"num": devuelve número entero sin separador de miles. En Chile el punto es separador de miles (NO decimal): $558.376 = 558376, $1.923 = 1923, $95.032.491 = 95032491
+- No inventes datos salvo campos con instrucción "ai".
+${inlineDataLine}
+Tipos válidos:
+${typeList}`
+
+    // Schema-enforced output. The multi-page PDF route is the primary
+    // beneficiary; single-image / single-PDF-page classify paths reuse the
+    // same builder so the contract is consistent across routes.
+    const doctypeIds = doctypes.map(d => d.id)
+    const schema = buildClassifyResponseSchema(doctypeIds, isPDF)
+
+    let vr: VisionResult
+    let requireConfidence = false
+    try {
+        vr = await model2vision(model, mimetype, base64, prompt, geminiModel, schema)
+    } catch (err) {
+        if (!isGeminiInvalidArgumentError(err)) throw err
+        const shapeOnlySchema = buildShapeOnlyClassifyResponseSchema(doctypeIds, isPDF)
+        vr = await model2vision(model, mimetype, base64, prompt, geminiModel, shapeOnlySchema)
+        requireConfidence = true
+    }
+    if (usageAccum) Object.assign(usageAccum, addUsage(usageAccum, vr.usage))
+    const rawDocs = parseRawDocs(vr.text)
+
+    return normalizeClassifyDocs(rawDocs, { requireConfidence, allowedIds: doctypeIds })
+}
+
+// ─── Pass 2: Extract fields ──────────────────────────────────────────────────
+
+async function extractFields(
+    base64: string, mimetype: string, model: AiModel, isPDF: boolean,
+    docTypeId: string, doctype: any,
+    entries: Array<{ start?: number; end?: number; partId?: string }>,
+    usageAccum?: AIUsage,
+    geminiModel?: string,
+): Promise<any[]> {
+    const fields = JSON.stringify(doctype.fieldDefs.map((f: any) => {
+        const entry: any = { key: f.key, type: f.type }
+        if (f.ai) entry.ai = f.ai
+        return entry
+    }))
+
+    const isCedula = docTypeId === 'cedula-identidad'
+    const cedulaBbox = isCedula ? `
+Si partId es "front", incluye "foto_bbox" en "data" con coordenadas (0-100%) de la foto: {x, y, width, height}. Incluye cabeza completa, cuello y hombros.` : ''
+
+    const hasConcreteRanges = entriesHaveConcreteRanges(isPDF, entries)
+    const pageHint = hasConcreteRanges
+        ? `Documentos detectados en páginas: ${entries.map(e => e.partId ? `${e.start}-${e.end} (${e.partId})` : `${e.start}-${e.end}`).join(', ')}.`
+        : ''
+
+    const dateInstruction = doctype.dateHint
+        ? `"docdate": ${doctype.dateHint}. Formato YYYY-MM-DD`
+        : `"docdate": la fecha a la que CORRESPONDE la información, NO cuándo fue emitido. Para certificados sin período, usar fecha de emisión. Formato YYYY-MM-DD`
+
+    const prompt = `Extrae los campos de "${doctype.label}" (id: "${docTypeId}").
+${pageHint}
+Devuelve JSON: {"documents":[{"id":"${docTypeId}","data":{...},"docdate":"YYYY-MM-DD"${hasConcreteRanges ? ',"start":N,"end":N' : ''}${isCedula ? ',"partId":"front|back"' : ''}}]}
+Campos: ${fields}
+${cedulaBbox}
+- ${dateInstruction}
+- Campos type:"num": devuelve número entero sin separador de miles. En Chile el punto es separador de miles (NO decimal): $558.376 = 558376, $1.923 = 1923, $95.032.491 = 95032491
+- No inventes datos salvo campos con instrucción "ai"
+- Distingue entre CERTIFICADO (emitido) y FORMULARIO (para llenar)
+- Solo JSON, sin markdown`
+
+    const schema = buildExtractResponseSchema(docTypeId, isPDF, entries)
+    const vr = await model2vision(model, mimetype, base64, prompt, geminiModel, schema || undefined)
+    if (usageAccum) Object.assign(usageAccum, addUsage(usageAccum, vr.usage))
+    return parseRawDocs(vr.text)
+}
+
+// ─── Main orchestrator ───────────────────────────────────────────────────────
+
+export async function Doc2Fields(
+    buffer: Buffer,
+    mimetype: string,
+    model: ModelArg = 'gemini',
+    forcedDoctypeId?: string,
+    options?: { skipFace?: boolean; geminiModels?: GeminiModels; allowedDoctypeIds?: AllowedDoctypeIds }
+): Promise<ExtractionResult> {
+    const isImage = mimetype.startsWith('image/')
+    const isPDF = mimetype === 'application/pdf'
+    if (!isImage && !isPDF) throw new Error('Images and PDFs only')
+
+    const { doctypes: fullDoctypes, mapById } = loadSchemas()
+
+    // Phase 7a: when the host passes a non-empty `allowedDoctypeIds`, restrict
+    // the classifier's candidate set to that subset. The schema enum, the
+    // prompt type-list, and the container-fallback `subDoctypes` are all derived
+    // from `doctypes` below — narrowing here flows through every classify call
+    // in this Doc2Fields invocation. An empty array is treated as "no narrowing"
+    // (defensive: an over-eager caller passing `[]` shouldn't cripple the call).
+    // Forced-doctype path is unaffected — it bypasses classify entirely.
+    const narrow = Array.isArray(options?.allowedDoctypeIds) && options!.allowedDoctypeIds!.length > 0
+    const doctypes = narrow
+        ? fullDoctypes.filter(dt => options!.allowedDoctypeIds!.includes(dt.id))
+        : fullDoctypes
+
+    const base64 = buffer.toString('base64')
+    const aiModel = toAiModel(model)
+    const usage: AIUsage = {}
+
+    // Per-phase model overrides (Gemini route only). Images and PDFs both use
+    // split-mode now so covered doctypes get the same schema-enforced Pass 2
+    // extraction contract. We just route each call to the right model.
+    const classifyGeminiModel = options?.geminiModels?.classify
+    const extractGeminiModel = options?.geminiModels?.extract
+
+    let allRawDocs: any[]
+
+    if (forcedDoctypeId) {
+        const doctype = mapById[forcedDoctypeId]
+        if (!doctype) return { documents: [] }
+        allRawDocs = await extractFields(base64, mimetype, aiModel, isPDF, forcedDoctypeId, doctype, [{}], usage, extractGeminiModel)
+    } else if (isImage) {
+        const classified = await classifyDocument(base64, mimetype, aiModel, false, doctypes, usage, classifyGeminiModel)
+        if (classified.length === 0) return { documents: [] }
+
+        const byType = new Map<string, Array<{ partId?: string; confidence?: number; data?: Record<string, unknown>; docdate?: string | null }>>()
+        for (const c of classified) {
+            const list = byType.get(c.id) || []
+            list.push({ partId: c.partId, confidence: c.confidence, data: c.data, docdate: c.docdate })
+            byType.set(c.id, list)
+        }
+
+        const extractionResults = await Promise.all(
+            Array.from(byType.entries()).map(async ([typeId, entries]) => {
+                const dt = mapById[typeId]
+                if (!dt) return { typeId, results: [] as any[] }
+                const results = await extractFields(
+                    base64, mimetype, aiModel, false, typeId, dt,
+                    entries.map(e => ({ partId: e.partId })),
+                    usage,
+                    extractGeminiModel,
+                )
+                return { typeId, results }
+            })
+        )
+        const extractedByType = new Map<string, any[]>()
+        for (const { typeId, results } of extractionResults) extractedByType.set(typeId, results)
+
+        allRawDocs = []
+        for (const [typeId, classEntries] of byType) {
+            if (!mapById[typeId]) continue
+            const ext = extractedByType.get(typeId) || []
+            for (let i = 0; i < classEntries.length; i++) {
+                const cls = classEntries[i]
+                const e = i < ext.length ? normalizeDoc(ext[i]) : null
+                allRawDocs.push({
+                    id: typeId,
+                    data: mergePassData(cls.data, e?.data as Record<string, unknown> | undefined),
+                    docdate: e?.docdate || cls.docdate || null,
+                    ...(cls.confidence !== undefined ? { confidence: cls.confidence } : {}),
+                    ...(cls.partId ? { partId: cls.partId } : {}),
+                })
+            }
+        }
+    } else {
+        let classified: Array<{ id: string; start?: number; end?: number; partId?: string; confidence?: number; data?: Record<string, unknown>; docdate?: string | null }>
+
+        let totalPages = 0
+        let pdfDoc: PDFDocument | null = null
+        // Hoisted so the container second-pass can reuse the slices instead of
+        // making a single big call against the full PDF.
+        let pageBase64s: string[] = []
+        try {
+            pdfDoc = await PDFDocument.load(buffer)
+            totalPages = pdfDoc.getPageCount()
+
+            if (totalPages > 1) {
+                // Classify each page individually, then merge adjacent pages
+                // with the same doctype into document ranges.
+                // This avoids context bias where a Maat informe comercial page
+                // gets misclassified as informe-deuda when grouped with debt pages.
+                //
+                // Two-phase to keep `pdf-lib` happy: page slicing runs serially
+                // because `copyPages` is async and shares state on the source
+                // `pdfDoc`; concurrent calls on the same source can interleave
+                // mid-await. Slicing is CPU-bound and cheap (~ms per page).
+                // Classification is the slow network call, so we fan that out
+                // through `Promise.all`. The host gate (`MAX_CONCURRENT`, 20 by
+                // default) caps real concurrency. A 10-page PDF goes from
+                // N×classify-latency sequential to roughly one classify-latency.
+                for (let p = 1; p <= totalPages; p++) {
+                    const out = await PDFDocument.create()
+                    const [copied] = await out.copyPages(pdfDoc, [p - 1])
+                    out.addPage(copied)
+                    pageBase64s.push(Buffer.from(await out.save()).toString('base64'))
+                }
+
+                // Each call accumulates into its own per-page usage bag so the
+                // shared `usage` object isn't subject to read-modify-write
+                // races between concurrent classify calls. We fold them all
+                // into the global `usage` once Promise.all resolves.
+                const perPageClassifications = await Promise.all(
+                    pageBase64s.map(async (b64) => {
+                        const localUsage: AIUsage = {}
+                        const classified = await classifyDocument(b64, mimetype, aiModel, false, doctypes, localUsage, classifyGeminiModel)
+                        return { classified, localUsage }
+                    })
+                )
+
+                const perPage: Array<{ id: string; page: number; partId?: string; confidence?: number; data?: Record<string, unknown>; docdate?: string | null }> = []
+                perPageClassifications.forEach(({ classified, localUsage }, idx) => {
+                    Object.assign(usage, addUsage(usage, localUsage))
+                    for (const c of classified) {
+                        perPage.push({ id: c.id, page: idx + 1, partId: c.partId, confidence: c.confidence, data: c.data, docdate: c.docdate })
+                    }
+                })
+
+                // Merge adjacent pages with the same doctype into ranges. Track
+                // the minimum per-page confidence across the merged span so a
+                // single low-confidence page in a multi-page block keeps the
+                // whole range below threshold.
+                //
+                // Phase 2 — for inline `data`/`docdate`, take the first page's
+                // values across the merged range. For multi-page same-doctype
+                // ranges (e.g. annual declarations), per-page snapshots are
+                // duplicates of the same document; for multi-doctype mixes
+                // they're already split into separate per-page entries here.
+                classified = []
+                for (let i = 0; i < perPage.length; i++) {
+                    const entry = perPage[i]
+                    // Cédula entries have partId and shouldn't be merged
+                    if (entry.partId) {
+                        classified.push({ id: entry.id, start: entry.page, end: entry.page, partId: entry.partId, ...(entry.confidence !== undefined ? { confidence: entry.confidence } : {}), ...(entry.data ? { data: entry.data } : {}), ...(entry.docdate ? { docdate: entry.docdate } : {}) })
+                        continue
+                    }
+                    let end = entry.page
+                    let minConf = entry.confidence
+                    while (
+                        i + 1 < perPage.length &&
+                        perPage[i + 1].id === entry.id &&
+                        !perPage[i + 1].partId &&
+                        perPage[i + 1].page === end + 1
+                    ) {
+                        end = perPage[i + 1].page
+                        const next = perPage[i + 1].confidence
+                        if (next !== undefined) minConf = minConf === undefined ? next : Math.min(minConf, next)
+                        i++
+                    }
+                    classified.push({ id: entry.id, start: entry.page, end, ...(minConf !== undefined ? { confidence: minConf } : {}), ...(entry.data ? { data: entry.data } : {}), ...(entry.docdate ? { docdate: entry.docdate } : {}) })
+                }
+            } else {
+                classified = await classifyDocument(base64, mimetype, aiModel, isPDF, doctypes, usage, classifyGeminiModel)
+            }
+        } catch {
+            classified = await classifyDocument(base64, mimetype, aiModel, isPDF, doctypes, usage, classifyGeminiModel)
+        }
+
+        if (classified.length === 0) {
+            return { documents: [] }
+        }
+
+        // Ensure composite cédulas have both front and back entries
+        {
+            const cedulaEntries = classified.filter(c => c.id === 'cedula-identidad')
+            for (const entry of cedulaEntries) {
+                if (!entry.partId) entry.partId = 'front'
+                if (entry.partId === 'front') {
+                    const hasBack = cedulaEntries.some(c =>
+                        c.partId === 'back' && c.start === entry.start && c.end === entry.end
+                    )
+                    if (!hasBack) {
+                        classified.push({
+                            id: 'cedula-identidad',
+                            start: entry.start,
+                            end: entry.end,
+                            partId: 'back',
+                        })
+                    }
+                }
+            }
+        }
+
+        // Auto-expand multi-page entries for multi-count doctypes.
+        // Skip annual doctypes (e.g. DAI) — a single annual document can span
+        // multiple pages, so expanding would incorrectly split it into separate files.
+        {
+            const expanded: typeof classified = []
+            for (const entry of classified) {
+                const dt = mapById[entry.id]
+                const span = (entry.start != null && entry.end != null) ? entry.end - entry.start + 1 : 1
+                const isCedulaEntry = entry.id === 'cedula-identidad' && !!entry.partId
+                const isAnnual = dt?.freq === 'annual'
+                if (dt && dt.count > 1 && span > 1 && !isCedulaEntry && !isAnnual) {
+                    for (let p = entry.start!; p <= entry.end!; p++) {
+                        expanded.push({ ...entry, start: p, end: p })
+                    }
+                } else {
+                    expanded.push(entry)
+                }
+            }
+            classified = expanded
+        }
+
+        // Container document detection: if a container doctype (e.g.
+        // carpeta-tributaria) is present without sub-documents inside that same
+        // range, do a second-pass classification against the contained doctypes.
+        // Preserve the detected container range; mixed PDFs may contain a
+        // container on only part of the file.
+        {
+            const containerEntries = classified.filter(c => mapById[c.id]?.contains?.length)
+
+            const hasValidRange = (
+                entry: { start?: number; end?: number },
+                minPage: number,
+                maxPage: number,
+            ): entry is { start: number; end: number } => {
+                const start = entry.start
+                const end = entry.end
+                if (typeof start !== 'number' || typeof end !== 'number') return false
+                if (!Number.isInteger(start) || !Number.isInteger(end)) return false
+                return start >= minPage && end <= maxPage && start <= end
+            }
+
+            for (const container of containerEntries) {
+                const containerDt = mapById[container.id]
+                if (!containerDt?.contains?.length) continue
+                const containedIds = new Set(containerDt.contains)
+                const containerStart = Number.isInteger(container.start) ? container.start! : 1
+                const containerEnd = Number.isInteger(container.end) ? container.end! : totalPages
+                if (containerStart < 1 || containerEnd > totalPages || containerStart > containerEnd) continue
+
+                // Check if any sub-documents were already identified inside this
+                // container's range. Children elsewhere in a mixed PDF should not
+                // suppress fallback for this container.
+                const hasSubDocs = classified.some(c =>
+                    containedIds.has(c.id) && hasValidRange(c, containerStart, containerEnd)
+                )
+
+                if (!hasSubDocs && totalPages > 1) {
+                    // Container range has no children — second-pass classification
+                    // against contained sub-doctypes only.
+                    //
+                    // Parallel per-page when slices are available.
+                    // A single full-PDF call here on flash-with-thinking on a 12+
+                    // page Carpeta Tributaria was tens of seconds; per-page parallel
+                    // is bounded by max(per-call) and the host's `MAX_CONCURRENT`.
+                    const subDoctypes = doctypes.filter(dt => containedIds.has(dt.id))
+                    if (subDoctypes.length === 0) continue
+
+                    if (pageBase64s.length === totalPages) {
+                        const pages: number[] = []
+                        for (let p = containerStart; p <= containerEnd; p++) pages.push(p)
+                        const subPerPage = await Promise.all(
+                            pages.map(async (page) => {
+                                const localUsage: AIUsage = {}
+                                const c = await classifyDocument(pageBase64s[page - 1], mimetype, aiModel, false, subDoctypes, localUsage, classifyGeminiModel)
+                                return { c, localUsage, page }
+                            })
+                        )
+                        // Merge adjacent same-doctype pages into ranges, same
+                        // policy as phase 1 (cédula entries with partId stay
+                        // single-page).
+                        const subPerPageFlat: Array<{ id: string; page: number; partId?: string; confidence?: number; data?: Record<string, unknown>; docdate?: string | null }> = []
+                        subPerPage.forEach(({ c, localUsage, page }) => {
+                            Object.assign(usage, addUsage(usage, localUsage))
+                            for (const entry of c) {
+                                subPerPageFlat.push({ id: entry.id, page, partId: entry.partId, confidence: entry.confidence, data: entry.data, docdate: entry.docdate })
+                            }
+                        })
+                        for (let i = 0; i < subPerPageFlat.length; i++) {
+                            const entry = subPerPageFlat[i]
+                            if (entry.partId) {
+                                classified.push({ id: entry.id, start: entry.page, end: entry.page, partId: entry.partId, ...(entry.confidence !== undefined ? { confidence: entry.confidence } : {}), ...(entry.data ? { data: entry.data } : {}), ...(entry.docdate ? { docdate: entry.docdate } : {}) })
+                                continue
+                            }
+                            let end = entry.page
+                            let minConf = entry.confidence
+                            while (
+                                i + 1 < subPerPageFlat.length &&
+                                subPerPageFlat[i + 1].id === entry.id &&
+                                !subPerPageFlat[i + 1].partId &&
+                                subPerPageFlat[i + 1].page === end + 1
+                            ) {
+                                end = subPerPageFlat[i + 1].page
+                                const next = subPerPageFlat[i + 1].confidence
+                                if (next !== undefined) minConf = minConf === undefined ? next : Math.min(minConf, next)
+                                i++
+                            }
+                            classified.push({ id: entry.id, start: entry.page, end, ...(minConf !== undefined ? { confidence: minConf } : {}), ...(entry.data ? { data: entry.data } : {}), ...(entry.docdate ? { docdate: entry.docdate } : {}) })
+                        }
+                    } else {
+                        // Fallback (slicing failed): one full-PDF call, but only
+                        // merge children whose returned range sits inside this
+                        // container's detected range.
+                        const subClassified = await classifyDocument(
+                            base64, mimetype, aiModel, isPDF, subDoctypes, usage, classifyGeminiModel
+                        )
+                        for (const sub of subClassified) {
+                            if (!containedIds.has(sub.id)) continue
+                            if (!hasValidRange(sub, containerStart, containerEnd)) continue
+                            classified.push(sub)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Group by doc type for Pass 2 — keep confidence + Pass 1 inline
+        // `data`/`docdate` alongside each entry. Pass 2 is more focused on
+        // the slice, so it wins at the field level when it returns a present
+        // value. Pass 1 fills gaps (missing/null/empty values) so a focused
+        // extractor cannot hide schema-enforced classify fields it omitted.
+        const byType = new Map<string, Array<{ start?: number; end?: number; partId?: string; confidence?: number; data?: Record<string, unknown>; docdate?: string | null }>>()
+        for (const c of classified) {
+            const existing = byType.get(c.id) || []
+            existing.push({ start: c.start, end: c.end, partId: c.partId, confidence: c.confidence, data: c.data, docdate: c.docdate })
+            byType.set(c.id, existing)
+        }
+
+        const MAX_PER_BATCH = 8
+        const extractionPromises: Array<Promise<any[]>> = []
+
+        for (const [docTypeId, entries] of byType) {
+            const doctype = mapById[docTypeId]
+            if (!doctype) continue
+
+            let extractBase64 = base64
+            let adjustedEntries = entries
+
+            if (pdfDoc && totalPages > 1 && entries.every(e => e.start != null && e.end != null)) {
+                const allPages = new Set<number>()
+                for (const e of entries) {
+                    for (let p = e.start!; p <= e.end!; p++) allPages.add(p)
+                }
+
+                if (allPages.size > 0 && allPages.size < totalPages) {
+                    try {
+                        const sortedPages = [...allPages].sort((a, b) => a - b)
+                        const out = await PDFDocument.create()
+                        const copied = await out.copyPages(pdfDoc, sortedPages.map(p => p - 1))
+                        copied.forEach(p => out.addPage(p))
+                        extractBase64 = Buffer.from(await out.save()).toString('base64')
+
+                        const pageMap = new Map(sortedPages.map((orig, idx) => [orig, idx + 1]))
+                        adjustedEntries = entries.map(e => ({
+                            ...e,
+                            start: pageMap.get(e.start!),
+                            end: pageMap.get(e.end!),
+                        }))
+                    } catch {
+                        // Fall back to full PDF
+                    }
+                }
+            }
+
+            if (adjustedEntries.length > MAX_PER_BATCH) {
+                for (let i = 0; i < adjustedEntries.length; i += MAX_PER_BATCH) {
+                    extractionPromises.push(
+                        extractFields(extractBase64, mimetype, aiModel, isPDF, docTypeId, doctype, adjustedEntries.slice(i, i + MAX_PER_BATCH), usage, extractGeminiModel)
+                    )
+                }
+            } else {
+                extractionPromises.push(
+                    extractFields(extractBase64, mimetype, aiModel, isPDF, docTypeId, doctype, adjustedEntries, usage, extractGeminiModel)
+                )
+            }
+        }
+
+        const extractionResults = await Promise.all(extractionPromises)
+
+        // Post-extraction merge: zip classified entries with extracted results.
+        // When extraction finds more documents than classified entries (e.g.
+        // two different-year DAIs within one merged page range), use the
+        // extra extracted docs with their own page ranges instead of dropping them.
+        {
+            const extractedByType = new Map<string, any[]>()
+            for (const raw of extractionResults.flat()) {
+                const n = normalizeDoc(raw)
+                if (!n.id) continue
+                if (!extractedByType.has(n.id)) extractedByType.set(n.id, [])
+                extractedByType.get(n.id)!.push(n)
+            }
+
+            allRawDocs = []
+            for (const [typeId, classEntries] of byType) {
+                if (!mapById[typeId]) continue
+                const sortedClass = [...classEntries].sort((a, b) => (a.start ?? 0) - (b.start ?? 0))
+                const sortedExtracted = (extractedByType.get(typeId) || [])
+                    .sort((a, b) => (a.start ?? 0) - (b.start ?? 0))
+
+                // If extraction returned more docs than classified (e.g. one
+                // merged range contained multiple annual instances), prefer
+                // the extracted results since they have finer page ranges.
+                // The confidence comes from the classifier, so all the split
+                // sub-docs inherit the minimum confidence of the parent range.
+                if (sortedExtracted.length > sortedClass.length && sortedClass.length > 0) {
+                    const classRange = {
+                        start: Math.min(...sortedClass.map(c => c.start ?? 0)),
+                        end: Math.max(...sortedClass.map(c => c.end ?? 0)),
+                    }
+                    const classConfidences = sortedClass.map(c => c.confidence).filter((v): v is number => v !== undefined)
+                    const minConf = classConfidences.length > 0 ? Math.min(...classConfidences) : undefined
+                    // When the extract pass split a merged range into multiple
+                    // sub-docs, no single classifier-inline payload aligns 1:1.
+                    // Inline-data fallback can't safely apply here — keep the
+                    // existing extract-only behavior.
+                    for (const ext of sortedExtracted) {
+                        const start = ext.start ?? classRange.start
+                        const end = ext.end ?? start
+                        allRawDocs.push({
+                            id: typeId,
+                            data: ext.data || {},
+                            docdate: ext.docdate || null,
+                            ...(minConf !== undefined ? { confidence: minConf } : {}),
+                            start,
+                            end,
+                        })
+                    }
+                } else {
+                    for (let i = 0; i < sortedClass.length; i++) {
+                        const cls = sortedClass[i]
+                        const ext = i < sortedExtracted.length ? sortedExtracted[i] : null
+
+                        // Pass 1/Pass 2 merge: Pass 2 wins per present field
+                        // because it saw the focused slice; Pass 1 fills gaps.
+                        // This keeps the current Pass 2 precedence while
+                        // avoiding wholesale loss when extract omits a field.
+                        const data = mergePassData(cls.data, ext?.data as Record<string, unknown> | undefined)
+                        const docdate = ext?.docdate || cls.docdate || null
+
+                        allRawDocs.push({
+                            id: typeId,
+                            data,
+                            docdate,
+                            ...(cls.confidence !== undefined ? { confidence: cls.confidence } : {}),
+                            start: cls.start,
+                            end: cls.end,
+                            ...(cls.partId ? { partId: cls.partId } : {}),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    // Process documents, handling face extraction for cedulas
+    const skipFace = options?.skipFace === true
+    const documents = await Promise.all(allRawDocs.map(async (d: any) => {
+        const normalized = normalizeDoc(d)
+        const { id, data, start, end, confidence } = normalized
+        let partId = normalized.partId
+        let docdate = normalized.docdate
+
+        if (id === 'cedula-identidad' && partId === 'front' && !skipFace) {
+            let imageBuffer: Buffer | null = null
+
+            if (isImage) {
+                imageBuffer = buffer
+            } else if (isPDF && typeof start === 'number') {
+                imageBuffer = await extractPdfPageAsImage(buffer, start)
+            }
+
+            if (imageBuffer) {
+                const result = await extractFace(imageBuffer)
+                if (result) {
+                    data.foto_base64 = result.face
+                } else {
+                    // AWS Rekognition is authoritative: no face ⇒ this is the back,
+                    // even if the AI labeled it "front". Flip partId so downstream
+                    // part-aware logic (filename, deleteExistingParts) treats it as back.
+                    partId = 'back'
+                }
+            }
+            delete data.foto_bbox
+        }
+
+        // Cedula back: AI often hallucinates front-only fields from the MRZ
+        // (e.g. reading 6-digit birth chunk as 1930-06-17). Strip them so the
+        // back row has no misleading dates — front is the authoritative source
+        // for fecha_nacimiento/emision/vencimiento/numero_documento. Also clear
+        // docdate so isFileExpired (maxAge based on ai_date) doesn't kill the
+        // back row and let a later front upload clobber its slot.
+        if (id === 'cedula-identidad' && partId === 'back') {
+            delete data.fecha_nacimiento
+            delete data.fecha_emision
+            delete data.fecha_vencimiento
+            delete data.numero_documento
+            delete data.foto_bbox
+            docdate = null
+        }
+
+        return {
+            doc_type_id: id,
+            label: id ? mapById?.[id]?.label || null : null,
+            data,
+            docdate,
+            ...(confidence !== undefined ? { confidence } : {}),
+            ...(Number.isFinite(start) ? { start } : {}),
+            ...(Number.isFinite(end) ? { end } : {}),
+            ...(partId ? { partId } : {}),
+        }
+    }))
+
+    // Post-processing: move back-side fields from front to back
+    for (const front of documents) {
+        if (front.doc_type_id !== 'cedula-identidad' || front.partId !== 'front') continue
+        const frontData = front.data as Record<string, any>
+        const back = documents.find(d =>
+            d.doc_type_id === 'cedula-identidad' && d.partId === 'back' &&
+            d.start === front.start && d.end === front.end
+        )
+        if (!back) continue
+        const backData = back.data as Record<string, any>
+
+        for (const key of ['lugar_nacimiento', 'profesion'] as const) {
+            if (frontData[key] && !backData[key]) {
+                backData[key] = frontData[key]
+                delete frontData[key]
+            }
+        }
+        if (!back.docdate && front.docdate) back.docdate = front.docdate
+    }
+
+    const hasUsage = usage.promptTokenCount || usage.candidatesTokenCount
+    return { documents, ...(hasUsage ? { usage } : {}) }
+}
