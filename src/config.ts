@@ -28,8 +28,8 @@ function getGlobal(): DocProcessorGlobal {
   if (!g[GLOBAL_KEY]) {
     g[GLOBAL_KEY] = {
       logger: {
-        error: (err: unknown, ctx?: Record<string, unknown>) => console.error('[docprocessor]', err, ctx),
-        warn: (msg: string, ctx?: Record<string, unknown>) => console.warn('[docprocessor]', msg, ctx),
+        error: (err: unknown, ctx?: Record<string, unknown>) => console.error('[cedula]', err, ctx),
+        warn: (msg: string, ctx?: Record<string, unknown>) => console.warn('[cedula]', msg, ctx),
       },
       rawDoctypes: null,
       geminiCall: null,

@@ -16,8 +16,8 @@ function getGlobal() {
   if (!g[GLOBAL_KEY]) {
     g[GLOBAL_KEY] = {
       logger: {
-        error: (err, ctx) => console.error("[docprocessor]", err, ctx),
-        warn: (msg, ctx) => console.warn("[docprocessor]", msg, ctx)
+        error: (err, ctx) => console.error("[cedula]", err, ctx),
+        warn: (msg, ctx) => console.warn("[cedula]", msg, ctx)
       },
       rawDoctypes: null,
       geminiCall: null
