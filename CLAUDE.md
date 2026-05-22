@@ -51,6 +51,10 @@ face-crop SHAs + bbox), the synthetic unreadable PDF, and the runners.
   field hashes are informational (model non-determinism). Both need Jogi
   credentials (Vertex + AWS) sourced from `/Users/avd/GitHub/jogi/.env.local`.
 
+`dev/` + `corpus/` are source-clone-only — the published artifact ships just
+`dist` (`files: ["dist"]`), and image bytes are gitignored, so the harness runs
+HERE (this clone), never from a consumer's `node_modules/@jogi/cedula`.
+
 ## Tech stack & rules
 
 - Node.js (server-only, no React). Build: tsup (CJS+ESM+dts). Tests: vitest.

@@ -39,3 +39,10 @@ pinned GitHub SHA (`npm run update:cedula`), never `#main` or `file:`.
 Image bytes, the id→filename map, the salt, and cleartext field values are
 gitignored (maintainer-local). Only PII-safe baselines (salted field hashes,
 face-crop SHAs, bbox) + a synthetic unreadable PDF + the runners are committed.
+
+> The corpus harness (`dev/` + `corpus/`) is a **source-clone tool**, run from
+> this repo at `~/GitHub/jogi@cedula`. The published artifact ships only `dist`
+> (`files: ["dist"]`), so `corpus:baseline` / `corpus:check` do **not** run from
+> a consumer's `node_modules/@jogi/cedula` — and couldn't anyway, since the
+> image bytes are gitignored and live only on the maintainer's machine. Debug a
+> cédula regression by working in this clone, where everything is present.
