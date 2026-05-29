@@ -9,8 +9,7 @@
  * ### Images → Split-pass (classifyDocument → extractFields)
  * Same schema contract as PDFs; images just omit page ranges.
  *
- * ### PDFs → Multi-pass (detectDocumentBoundaries → classifyDocument → extractFields)
- * Pass 0 — Split: detect document boundaries in multi-doc PDFs (no doctype knowledge)
+ * ### PDFs → Two-pass (classifyDocument → extractFields)
  * Pass 1 — Classify: each document individually with doctype definitions + field schemas
  * Pass 2 — Extract: per-type field schemas, parallel across types
  *
@@ -21,10 +20,8 @@
 import { model2vision, toAiModel, stripFences } from './ai'
 import type { VisionResult, AiModel, ResponseSchema } from './ai'
 import { getDoctypes, getDoctypesMap } from './doctypes'
-import { getLogger } from './config'
 import { PDFDocument } from 'pdf-lib'
 import { extractFace } from './faceextract'
-import sharp from 'sharp'
 import { createHash } from 'crypto'
 import type { ModelArg, ExtractionResult, AIUsage, GeminiModels, AllowedDoctypeIds } from './types'
 
@@ -301,36 +298,6 @@ export function normalizeDoc(d: any) {
     const partId = d?.partId || d?.part_id || d?.partid || undefined
     const confidence = typeof d?.confidence === 'number' && d.confidence >= 0 && d.confidence <= 1 ? d.confidence : undefined
     return { id, data, docdate, start, end, partId, confidence }
-}
-
-// ─── Pass 0: Detect document boundaries in multi-doc PDFs ───────────────────
-
-async function detectDocumentBoundaries(
-    base64: string, model: AiModel, totalPages: number,
-    usageAccum?: AIUsage,
-    geminiModel?: string,
-): Promise<Array<{ start: number; end: number }>> {
-    const prompt = `Este PDF tiene ${totalPages} páginas y puede contener múltiples documentos combinados.
-Identifica los límites de cada documento separado dentro del PDF.
-Devuelve JSON: {"documents":[{"start":1,"end":3},{"start":4,"end":4},{"start":5,"end":8}]}
-- "start"/"end": páginas 1-indexed
-- Cada documento es un bloque continuo de páginas que pertenecen al mismo documento original
-- Busca cambios de formato, encabezados, logos, o estilos que indiquen un documento diferente
-- Si todo el PDF es un solo documento, devuelve [{"start":1,"end":${totalPages}}]
-- Solo JSON, sin markdown`
-
-    const vr = await model2vision(model, 'application/pdf', base64, prompt, geminiModel)
-    if (usageAccum) Object.assign(usageAccum, addUsage(usageAccum, vr.usage))
-    const parsed = parseRawDocs(vr.text)
-
-    if (!parsed.length) return [{ start: 1, end: totalPages }]
-
-    return parsed
-        .map((d: any) => ({
-            start: Number.isFinite(d?.start) ? Number(d.start) : parseInt(d?.start, 10),
-            end: Number.isFinite(d?.end) ? Number(d.end) : parseInt(d?.end, 10),
-        }))
-        .filter((d: { start: number; end: number }) => Number.isFinite(d.start) && Number.isFinite(d.end))
 }
 
 // ─── Pass 1: Classify ────────────────────────────────────────────────────────

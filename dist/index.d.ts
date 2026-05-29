@@ -65,8 +65,7 @@ interface CompositeCedulaResult extends CompositeSplitResult {
  * ### Images → Split-pass (classifyDocument → extractFields)
  * Same schema contract as PDFs; images just omit page ranges.
  *
- * ### PDFs → Multi-pass (detectDocumentBoundaries → classifyDocument → extractFields)
- * Pass 0 — Split: detect document boundaries in multi-doc PDFs (no doctype knowledge)
+ * ### PDFs → Two-pass (classifyDocument → extractFields)
  * Pass 1 — Classify: each document individually with doctype definitions + field schemas
  * Pass 2 — Extract: per-type field schemas, parallel across types
  *
