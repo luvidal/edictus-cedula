@@ -1,4 +1,4 @@
-// @jogi/cedula — server-only entry point (heavy deps: sharp, AI SDKs, pdf-lib,
+// @edictus/cedula — server-only entry point (heavy deps: sharp, AI SDKs, pdf-lib,
 // AWS Rekognition).
 //
 // PUBLIC SURFACE = the three per-operation façades + configure + the public

@@ -43,7 +43,7 @@ function getRawDoctypes() {
   const raw = getGlobal().rawDoctypes;
   if (!raw) {
     throw new Error(
-      "@jogi/cedula: doctypes not configured. Call configure({ doctypes }) before using doctype functions."
+      "@edictus/cedula: doctypes not configured. Call configure({ doctypes }) before using doctype functions."
     );
   }
   return raw;

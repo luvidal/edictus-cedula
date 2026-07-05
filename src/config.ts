@@ -13,7 +13,7 @@ export type GeminiCall = (params: { model: string; contents: any; config?: any }
 
 // Use globalThis to share state across module scopes within this package.
 // MUST be distinct from @jogi/docs's key (`__avd_docprocessor__`) so the two
-// packages keep independent doctypes/geminiCall/logger state — @jogi/cedula is
+// packages keep independent doctypes/geminiCall/logger state — @edictus/cedula is
 // configured separately and must survive @jogi/docs's eventual retirement.
 const GLOBAL_KEY = '__jogi_cedula__' as const
 
@@ -63,7 +63,7 @@ export function getRawDoctypes(): Record<string, unknown> {
   const raw = getGlobal().rawDoctypes
   if (!raw) {
     throw new Error(
-      '@jogi/cedula: doctypes not configured. Call configure({ doctypes }) before using doctype functions.'
+      '@edictus/cedula: doctypes not configured. Call configure({ doctypes }) before using doctype functions.'
     )
   }
   return raw
