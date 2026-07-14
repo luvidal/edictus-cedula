@@ -1,8 +1,8 @@
-# @jogi/cedula — Chilean ID-card (cédula) processing satellite
+# @edictus/cedula — Chilean ID-card (cédula) processing satellite
 
 Standalone computer-vision satellite for Chilean cédulas de identidad: composite
 front/back split, face extraction, side detection, and cédula field OCR.
-Lift-and-shifted from the cédula surface of `@jogi/docs` so cédulas — a CV
+Lift-and-shifted from the cédula surface of the original monolithic `docs` package so cédulas — a CV
 problem class, distinct from text-doc extraction — own their own home + corpus.
 
 ## Public surface (the façade — Option B)
@@ -53,7 +53,7 @@ face-crop SHAs + bbox), the synthetic unreadable PDF, and the runners.
 
 `dev/` + `corpus/` are source-clone-only — the published artifact ships just
 `dist` (`files: ["dist"]`), and image bytes are gitignored, so the harness runs
-HERE (this clone), never from a consumer's `node_modules/@jogi/cedula`.
+HERE (this clone), never from a consumer's `node_modules/@edictus/cedula`.
 
 ## Tech stack & rules
 
@@ -71,4 +71,4 @@ unreadable-PDF path + the pure merge tests); full parity is the local
 ## Consumer integration
 
 Consumed by Jogi via pinned GitHub SHA (never `#main`, never `file:`):
-`@jogi/cedula@github:luvidal/jogi-cedula#<SHA>` · `npm run update:cedula`.
+`@edictus/cedula@github:luvidal/edictus-cedula#<SHA>` · `npm run update:cedula`.
