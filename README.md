@@ -1,5 +1,7 @@
 # @edictus/cedula
 
+**English** · [Español](README.es.md)
+
 Computer vision for Chilean ID cards (*cédula de identidad*). This package
 handles four jobs:
 
