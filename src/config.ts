@@ -12,10 +12,10 @@ export interface DocProcessorLogger {
 export type GeminiCall = (params: { model: string; contents: any; config?: any }) => Promise<any>
 
 // Use globalThis to share state across module scopes within this package.
-// MUST be distinct from @jogi/docs's key (`__avd_docprocessor__`) so the two
+// MUST be distinct from the legacy docs package's key (`__avd_docprocessor__`) so the two
 // packages keep independent doctypes/geminiCall/logger state — @edictus/cedula is
-// configured separately and must survive @jogi/docs's eventual retirement.
-const GLOBAL_KEY = '__jogi_cedula__' as const
+// configured separately and must survive the legacy docs package's eventual retirement.
+const GLOBAL_KEY = '__edictus_cedula__' as const
 
 interface DocProcessorGlobal {
   logger: DocProcessorLogger

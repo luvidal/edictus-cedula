@@ -49,7 +49,7 @@ function addUsage(total: AIUsage, add?: AIUsage): AIUsage {
 // and prompt type-list are restricted to that subset, so the model can't return
 // off-list doctypes for the upload's request scope. Container fallback (Phase
 // 7b) reuses the same mechanism with `parent.contains` as the candidate set.
-// Cache entries are not affected by the option itself; the Jogi-side cache key
+// Cache entries are not affected by the option itself; the host-side cache key
 // folds the candidate set so narrowed and full-catalog calls don't collide.
 // v9: container second-pass classification preserves the classifier's detected
 // container range instead of rewriting each container to the full PDF. Mixed PDFs

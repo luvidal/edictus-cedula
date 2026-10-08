@@ -10,7 +10,7 @@ function _interopDefault (e) { return e && e.__esModule ? e : { default: e }; }
 var sharp__default = /*#__PURE__*/_interopDefault(sharp);
 
 // src/config.ts
-var GLOBAL_KEY = "__jogi_cedula__";
+var GLOBAL_KEY = "__edictus_cedula__";
 function getGlobal() {
   const g = globalThis;
   if (!g[GLOBAL_KEY]) {

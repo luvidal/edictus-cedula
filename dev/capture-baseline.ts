@@ -5,13 +5,13 @@
  *  - corpus/baseline.json        (COMMITTED — PII-safe: hashed fields, face SHAs, bbox)
  *  - corpus/cleartext/<id>.json  (GITIGNORED — cleartext field values for local debugging)
  *
- * The satellite is a verbatim lift-and-shift of the @jogi/docs cédula code, so
- * this baseline IS the @jogi/docs baseline by construction. It is the safety
+ * The satellite is a verbatim lift-and-shift of the legacy docs package's cédula code, so
+ * this baseline IS the legacy docs package's baseline by construction. It is the safety
  * net: future model bumps / refactors that change a face crop, bbox, partId, or
  * rendered-source metadata fail the parity check loudly.
  *
- * Usage (from the satellite root, with Jogi credentials in scope):
- *   source /Users/avd/GitHub/jogi/.env.local && npm run corpus:baseline
+ * Usage (from the satellite root, with host credentials in scope):
+ *   npm run corpus:baseline
  */
 
 import { writeFileSync } from 'fs'

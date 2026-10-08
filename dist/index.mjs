@@ -4,7 +4,7 @@ import sharp from 'sharp';
 import { DetectFacesCommand, RekognitionClient } from '@aws-sdk/client-rekognition';
 
 // src/config.ts
-var GLOBAL_KEY = "__jogi_cedula__";
+var GLOBAL_KEY = "__edictus_cedula__";
 function getGlobal() {
   const g = globalThis;
   if (!g[GLOBAL_KEY]) {

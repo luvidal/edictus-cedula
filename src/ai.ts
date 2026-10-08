@@ -6,7 +6,7 @@ export type ResponseSchema = Record<string, unknown>
 
 /**
  * True when *something* can service a Gemini call: either a host-provided
- * gate (e.g. Jogi routing through Vertex AI) or a local API key. Used by the
+ * gate (e.g. a host routing through Vertex AI) or a local API key. Used by the
  * gates below so switching the host to Vertex doesn't require keeping a
  * dead `GEMINI_API_KEY` in the env just to satisfy these checks.
  */

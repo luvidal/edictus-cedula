@@ -2,13 +2,13 @@
  * Shared corpus runner — used by capture-baseline.ts and check-corpus.ts.
  *
  * Wires the satellite for STANDALONE local use:
- *  - doctypes catalog: read from the sibling Jogi checkout (single source of truth)
- *  - geminiCall: a Vertex-AI client (Jogi runs Gemini on Vertex, not API-key mode),
+ *  - doctypes catalog: read from the sibling host checkout (single source of truth)
+ *  - geminiCall: a Vertex-AI client (the host runs Gemini on Vertex, not API-key mode),
  *    mirroring lib/server/gemini.ts. This is the same injection the host does via
  *    configure() — without it the satellite's ai.ts would fall back to a
- *    GEMINI_API_KEY the Jogi environment doesn't set.
+ *    GEMINI_API_KEY the host environment doesn't set.
  *  - AWS Rekognition: faceextract.ts uses the default credential chain + AWS_REGION
- *    (source Jogi's .env.local before running).
+ *    (export the host credentials before running).
  *
  * Produces one PII-SAFE observation per fixture (hashed field values, face-crop
  * SHA, rounded bbox, structural partIds) plus a SEPARATE cleartext record that
@@ -70,13 +70,13 @@ let configured = false
 export async function configureSatellite(): Promise<void> {
   if (configured) return
   const doctypesPath =
-    process.env.JOGI_DATA_DOCTYPES || path.resolve(ROOT, '../jogi/data/doctypes.json')
+    process.env.DOCTYPES_PATH || path.resolve(ROOT, 'corpus/doctypes.json')
   const doctypes = JSON.parse(readFileSync(doctypesPath, 'utf8'))
 
   const project = process.env.GOOGLE_CLOUD_PROJECT
   const location = process.env.GOOGLE_CLOUD_LOCATION
   if (!project || !location) {
-    throw new Error('Missing GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION — source Jogi .env.local first.')
+    throw new Error('Missing GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION — set them in your environment first.')
   }
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { GoogleGenAI } = await import('@google/genai')

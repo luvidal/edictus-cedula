@@ -33,7 +33,7 @@ pinned GitHub SHA (`npm run update:cedula`), never `#main` or `file:`.
 - `npm run build` — bundle `dist/` (CJS + ESM + types).
 - `npm test` — vitest (runs without credentials).
 - `npm run corpus:baseline` / `npm run corpus:check` — capture/verify the
-  regression corpus locally (needs Jogi Vertex + AWS credentials; see CLAUDE.md).
+  regression corpus locally (needs Vertex + AWS credentials; see `dev/corpus-runner.ts`).
 
 ## Regression corpus
 
@@ -42,7 +42,7 @@ gitignored (maintainer-local). Only PII-safe baselines (salted field hashes,
 face-crop SHAs, bbox) + a synthetic unreadable PDF + the runners are committed.
 
 > The corpus harness (`dev/` + `corpus/`) is a **source-clone tool**, run from
-> this repo at `~/GitHub/jogi@cedula`. The published artifact ships only `dist`
+> a local clone of this repo. The published artifact ships only `dist`
 > (`files: ["dist"]`), so `corpus:baseline` / `corpus:check` do **not** run from
 > a consumer's `node_modules/@edictus/cedula` — and couldn't anyway, since the
 > image bytes are gitignored and live only on the maintainer's machine. Debug a

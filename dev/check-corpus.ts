@@ -12,7 +12,7 @@
  * to inspect, not necessarily a failure.
  *
  * Usage:
- *   source /Users/avd/GitHub/jogi/.env.local && npm run corpus:check
+ *   npm run corpus:check
  */
 
 import { readFileSync, existsSync } from 'fs'
